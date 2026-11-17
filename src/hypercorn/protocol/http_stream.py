@@ -129,7 +129,13 @@ class HTTPStream:
             if self.state != ASGIHTTPState.CLOSED:
                 await self.config.log.access(self.scope, None, time() - self.start_time)
             if self.app_put is not None:
-                await self.app_put({"type": "http.disconnect"})
+                # A finished response cannot wait on unread request bodies.
+                # Before response completion, preserve queued request data
+                # (e.g. an HTTP/1 client half-closing its write side).
+                if self.state == ASGIHTTPState.CLOSED:
+                    await self.app_put({"type": "http.disconnect"}, discard_pending=True)
+                else:
+                    await self.app_put({"type": "http.disconnect"})
 
     async def app_send(self, message: ASGISendEvent | None) -> None:
         if message is None:  # ASGI App has finished sending messages

@@ -198,11 +198,16 @@ async def test_http2_websocket() -> None:
     h2_client = h2.connection.H2Connection()
     h2_client.initiate_connection()
     await server.reader.send(h2_client.data_to_send())  # type: ignore
+    # Extended CONNECT requires the peer's ENABLE_CONNECT_PROTOCOL setting.
+    h2_client.receive_data(await server.writer.receive())  # type: ignore
+    assert h2_client.remote_settings.enable_connect_protocol == 1
+    await server.reader.send(h2_client.data_to_send())  # type: ignore
     stream_id = h2_client.get_next_available_stream_id()
     h2_client.send_headers(
         stream_id,
         [
             (":method", "CONNECT"),
+            (":protocol", "websocket"),
             (":path", "/"),
             (":authority", "hypercorn"),
             (":scheme", "https"),
@@ -210,28 +215,43 @@ async def test_http2_websocket() -> None:
         ],
     )
     await server.reader.send(h2_client.data_to_send())  # type: ignore
-    events = h2_client.receive_data(await server.writer.receive())  # type: ignore
-    await server.reader.send(h2_client.data_to_send())  # type: ignore
-    events = h2_client.receive_data(await server.writer.receive())  # type: ignore
-    events = h2_client.receive_data(await server.writer.receive())  # type: ignore
-    assert isinstance(events[0], h2.events.ResponseReceived)
-    assert events[0].headers == [
+    response = None
+    for _ in range(4):
+        events = h2_client.receive_data(
+            await asyncio.wait_for(server.writer.receive(), 1)  # type: ignore
+        )
+        await server.reader.send(h2_client.data_to_send())  # type: ignore
+        for event in events:
+            if isinstance(event, h2.events.ResponseReceived):
+                response = event
+                break
+        if response is not None:
+            break
+    assert response is not None
+    assert response.headers == [
         (b":status", b"200"),
         (b"date", b"Thu, 01 Jan 1970 01:23:20 GMT"),
         (b"server", b"hypercorn-h2"),
     ]
+
+    async def receive_h2_data() -> bytes:
+        for _ in range(8):
+            events = h2_client.receive_data(
+                await asyncio.wait_for(server.writer.receive(), 1)  # type: ignore
+            )
+            for event in events:
+                if isinstance(event, h2.events.DataReceived):
+                    return event.data
+        raise AssertionError("WebSocket H2 DATA frame was never received")
+
     client = wsproto.connection.Connection(wsproto.ConnectionType.CLIENT)
     h2_client.send_data(stream_id, client.send(wsproto.events.BytesMessage(data=SANITY_BODY)))
     await server.reader.send(h2_client.data_to_send())  # type: ignore
-    events = h2_client.receive_data(await server.writer.receive())  # type: ignore
-    assert isinstance(events[0], h2.events.DataReceived)
-    client.receive_data(events[0].data)
+    client.receive_data(await receive_h2_data())
     assert list(client.events()) == [wsproto.events.TextMessage(data="Hello & Goodbye")]
     h2_client.send_data(stream_id, client.send(wsproto.events.CloseConnection(code=1000)))
     await server.reader.send(h2_client.data_to_send())  # type: ignore
-    events = h2_client.receive_data(await server.writer.receive())  # type: ignore
-    assert isinstance(events[0], h2.events.DataReceived)
-    client.receive_data(events[0].data)
+    client.receive_data(await receive_h2_data())
     assert list(client.events()) == [wsproto.events.CloseConnection(code=1000, reason="")]
     h2_client.close_connection()
     await server.reader.send(h2_client.data_to_send())  # type: ignore

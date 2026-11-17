@@ -170,11 +170,16 @@ async def test_http2_websocket(nursery: trio._core._run.Nursery) -> None:
     h2_client = h2.connection.H2Connection()
     h2_client.initiate_connection()
     await client_stream.send_all(h2_client.data_to_send())
+    # Extended CONNECT is legal only after the server advertises support.
+    h2_client.receive_data(await client_stream.receive_some(1024))
+    assert h2_client.remote_settings.enable_connect_protocol == 1
+    await client_stream.send_all(h2_client.data_to_send())
     stream_id = h2_client.get_next_available_stream_id()
     h2_client.send_headers(
         stream_id,
         [
             (":method", "CONNECT"),
+            (":protocol", "websocket"),
             (":path", "/"),
             (":authority", "hypercorn"),
             (":scheme", "https"),
@@ -182,28 +187,36 @@ async def test_http2_websocket(nursery: trio._core._run.Nursery) -> None:
         ],
     )
     await client_stream.send_all(h2_client.data_to_send())
-    events = h2_client.receive_data(await client_stream.receive_some(1024))
-    await client_stream.send_all(h2_client.data_to_send())
-    events = h2_client.receive_data(await client_stream.receive_some(1024))
-    if not isinstance(events[-1], h2.events.ResponseReceived):
-        events = h2_client.receive_data(await client_stream.receive_some(1024))
-    assert isinstance(events[-1], h2.events.ResponseReceived)
-    assert events[-1].headers == [
+    response = None
+    with trio.fail_after(2):
+        while response is None:
+            events = h2_client.receive_data(await client_stream.receive_some(1024))
+            await client_stream.send_all(h2_client.data_to_send())
+            response = next(
+                (event for event in events if isinstance(event, h2.events.ResponseReceived)), None
+            )
+    assert response.headers == [
         (b":status", b"200"),
         (b"date", b"Thu, 01 Jan 1970 01:23:20 GMT"),
         (b"server", b"hypercorn-h2"),
     ]
+
+    async def receive_h2_data() -> bytes:
+        with trio.fail_after(2):
+            while True:
+                events = h2_client.receive_data(await client_stream.receive_some(1024))
+                for event in events:
+                    if isinstance(event, h2.events.DataReceived):
+                        return event.data
+        raise AssertionError("WebSocket H2 DATA frame was never received")
+
     client = wsproto.connection.Connection(wsproto.ConnectionType.CLIENT)
     h2_client.send_data(stream_id, client.send(wsproto.events.BytesMessage(data=SANITY_BODY)))
     await client_stream.send_all(h2_client.data_to_send())
-    events = h2_client.receive_data(await client_stream.receive_some(1024))
-    assert isinstance(events[0], h2.events.DataReceived)
-    client.receive_data(events[0].data)
+    client.receive_data(await receive_h2_data())
     assert list(client.events()) == [wsproto.events.TextMessage(data="Hello & Goodbye")]
     h2_client.send_data(stream_id, client.send(wsproto.events.CloseConnection(code=1000)))
     await client_stream.send_all(h2_client.data_to_send())
-    events = h2_client.receive_data(await client_stream.receive_some(1024))
-    assert isinstance(events[0], h2.events.DataReceived)
-    client.receive_data(events[0].data)
+    client.receive_data(await receive_h2_data())
     assert list(client.events()) == [wsproto.events.CloseConnection(code=1000, reason="")]
     await client_stream.send_all(b"")
