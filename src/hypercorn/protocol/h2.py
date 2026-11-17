@@ -61,11 +61,28 @@ class StreamBuffer:
     async def push(self, data: bytes) -> None:
         if self._complete:
             raise BufferCompleteError()
-        self.buffer.extend(data)
-        await self._is_empty.clear()
-        if len(self.buffer) >= BUFFER_HIGH_WATER:
-            await self._paused.wait()
-            await self._paused.clear()
+        # Most responses fit in a single HTTP/2 DATA frame. Keep that path
+        # allocation-free while enforcing a strict cap on oversized writes.
+        if data and len(data) + len(self.buffer) < BUFFER_HIGH_WATER:
+            self.buffer.extend(data)
+            await self._is_empty.clear()
+            return
+        remaining = memoryview(data)
+        while remaining:
+            if self._complete:
+                return  # Teardown awakened a previously blocked writer.
+            space = BUFFER_HIGH_WATER - len(self.buffer)
+            if space:
+                self.buffer.extend(remaining[:space])
+                remaining = remaining[space:]
+                await self._is_empty.clear()
+            if len(self.buffer) >= BUFFER_HIGH_WATER:
+                # Clear any old low-water signal before checking live capacity.
+                await self._paused.clear()
+                if len(self.buffer) > BUFFER_LOW_WATER and not self._complete:
+                    await self._paused.wait()
+                if self._complete:
+                    return
 
     async def pop(self, max_length: int) -> bytes:
         length = min(len(self.buffer), max_length)
@@ -195,6 +212,7 @@ class H2Protocol:
                 events = self.connection.receive_data(event.data)
             except h2.exceptions.ProtocolError:
                 await self._flush()
+                await self.handle(Closed())
                 await self.send(Closed())
             else:
                 await self._handle_events(events)
@@ -292,6 +310,7 @@ class H2Protocol:
                 if h2.settings.SettingCodes.INITIAL_WINDOW_SIZE in event.changed_settings:
                     await self._window_updated(None)
             elif isinstance(event, h2.events.ConnectionTerminated):
+                await self.handle(Closed())
                 await self.send(Closed())
         await self._flush()
 
