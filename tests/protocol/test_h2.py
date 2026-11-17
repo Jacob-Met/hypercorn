@@ -25,6 +25,7 @@ async def test_stream_buffer_push_and_pop() -> None:
         return True
 
     task = event_loop.create_task(_push_over_limit())
+    await asyncio.sleep(0)  # Ensure the producer actually reaches high water.
     assert not task.done()  # Blocked as over high water
     await stream_buffer.pop(BUFFER_HIGH_WATER // 4)
     assert not task.done()  # Blocked as over low water

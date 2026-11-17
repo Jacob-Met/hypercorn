@@ -61,17 +61,28 @@ class StreamBuffer:
     async def push(self, data: bytes) -> None:
         if self._complete:
             raise BufferCompleteError()
-        self.buffer.extend(data)
-        await self._is_empty.clear()
-        if len(self.buffer) >= BUFFER_HIGH_WATER:
-            await self._paused.wait()
-            await self._paused.clear()
+        remaining = memoryview(data)
+        while remaining:
+            if self._complete:
+                raise BufferCompleteError()
+            space = BUFFER_HIGH_WATER - len(self.buffer)
+            if space:
+                self.buffer.extend(remaining[:space])
+                remaining = remaining[space:]
+                await self._is_empty.clear()
+            if len(self.buffer) >= BUFFER_HIGH_WATER:
+                # A stale low-water signal must not release a new producer.
+                await self._paused.clear()
+                if len(self.buffer) > BUFFER_LOW_WATER and not self._complete:
+                    await self._paused.wait()
+                if self._complete:
+                    raise BufferCompleteError()
 
     async def pop(self, max_length: int) -> bytes:
         length = min(len(self.buffer), max_length)
         data = bytes(self.buffer[:length])
         del self.buffer[:length]
-        if len(data) < BUFFER_LOW_WATER:
+        if length and len(self.buffer) <= BUFFER_LOW_WATER:
             await self._paused.set()
         if len(self.buffer) == 0:
             await self._is_empty.set()
@@ -154,30 +165,37 @@ class H2Protocol:
                 await self._send_data(stream_id)
 
     async def _send_data(self, stream_id: int) -> None:
+        stream_buffer = self.stream_buffers.get(stream_id)
+        if stream_buffer is None:
+            return
         try:
             chunk_size = min(
                 self.connection.local_flow_control_window(stream_id),
                 self.connection.max_outbound_frame_size,
             )
             chunk_size = max(0, chunk_size)
-            data = await self.stream_buffers[stream_id].pop(chunk_size)
+            data = await stream_buffer.pop(chunk_size)
+            if self.stream_buffers.get(stream_id) is not stream_buffer:
+                return  # Reset or close while waiting to send.
             if data:
                 self.connection.send_data(stream_id, data)
                 await self._flush()
             else:
                 self.priority.block(stream_id)
 
-            if self.stream_buffers[stream_id].complete:
+            if stream_buffer.complete:
                 self.connection.end_stream(stream_id)
                 await self._flush()
                 del self.stream_buffers[stream_id]
                 self.priority.remove_stream(stream_id)
-        except (h2.exceptions.StreamClosedError, KeyError, h2.exceptions.ProtocolError):
-            # Stream or connection has closed whilst waiting to send
-            # data, not a problem - just force close it.
-            await self.stream_buffers[stream_id].close()
-            del self.stream_buffers[stream_id]
-            self.priority.remove_stream(stream_id)
+        except (
+            h2.exceptions.StreamClosedError,
+            KeyError,
+            priority.MissingStreamError,
+            h2.exceptions.ProtocolError,
+        ):
+            # The peer or transport closed while sending; retire this buffer.
+            await self._close_buffer(stream_id)
 
     async def handle(self, event: Event) -> None:
         if isinstance(event, RawData):
@@ -190,8 +208,7 @@ class H2Protocol:
                 await self._handle_events(events)
         elif isinstance(event, Closed):
             self.closed = True
-            stream_ids = list(self.streams.keys())
-            for stream_id in stream_ids:
+            for stream_id in set(self.streams) | set(self.stream_buffers):
                 await self._close_stream(stream_id)
             await self.has_data.set()
 
@@ -280,6 +297,7 @@ class H2Protocol:
                 if h2.settings.SettingCodes.INITIAL_WINDOW_SIZE in event.changed_settings:
                     await self._window_updated(None)
             elif isinstance(event, h2.events.ConnectionTerminated):
+                await self.handle(Closed())
                 await self.send(Closed())
         await self._flush()
 
@@ -393,7 +411,18 @@ class H2Protocol:
             await self.streams[event.stream_id].handle(EndBody(stream_id=event.stream_id))
             self.keep_alive_requests += 1
 
+    async def _close_buffer(self, stream_id: int) -> None:
+        stream_buffer = self.stream_buffers.pop(stream_id, None)
+        if stream_buffer is not None:
+            await stream_buffer.close()
+        try:
+            self.priority.remove_stream(stream_id)
+        except priority.MissingStreamError:
+            pass
+
     async def _close_stream(self, stream_id: int) -> None:
+        # Wake the ASGI sender before propagating the peer disconnect.
+        await self._close_buffer(stream_id)
         if stream_id in self.streams:
             stream = self.streams.pop(stream_id)
             await stream.handle(StreamClosed(stream_id=stream_id))
