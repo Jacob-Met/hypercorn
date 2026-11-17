@@ -71,7 +71,10 @@ class StreamBuffer:
         length = min(len(self.buffer), max_length)
         data = bytes(self.buffer[:length])
         del self.buffer[:length]
-        if len(data) < BUFFER_LOW_WATER:
+        # Producer credit depends on the buffered *remainder*, not the
+        # amount returned. In particular, pop(0) when the peer window is
+        # exhausted must not unpause a writer holding megabytes of data.
+        if len(self.buffer) < BUFFER_LOW_WATER:
             await self._paused.set()
         if len(self.buffer) == 0:
             await self._is_empty.set()
@@ -170,14 +173,21 @@ class H2Protocol:
             if self.stream_buffers[stream_id].complete:
                 self.connection.end_stream(stream_id)
                 await self._flush()
-                del self.stream_buffers[stream_id]
-                self.priority.remove_stream(stream_id)
+                await self._retire_stream_buffer(stream_id)
         except (h2.exceptions.StreamClosedError, KeyError, h2.exceptions.ProtocolError):
-            # Stream or connection has closed whilst waiting to send
-            # data, not a problem - just force close it.
-            await self.stream_buffers[stream_id].close()
-            del self.stream_buffers[stream_id]
+            # The reader may have retired this stream concurrently. Releasing
+            # the buffer twice is safe and must not crash the sender task.
+            await self._retire_stream_buffer(stream_id)
+
+    async def _retire_stream_buffer(self, stream_id: int) -> None:
+        """Discard pending bytes and wake senders waiting on flow control."""
+        buffer = self.stream_buffers.pop(stream_id, None)
+        if buffer is not None:
+            await buffer.close()
+        try:
             self.priority.remove_stream(stream_id)
+        except priority.MissingStreamError:
+            pass
 
     async def handle(self, event: Event) -> None:
         if isinstance(event, RawData):
@@ -190,7 +200,9 @@ class H2Protocol:
                 await self._handle_events(events)
         elif isinstance(event, Closed):
             self.closed = True
-            stream_ids = list(self.streams.keys())
+            # A stream may have left the HTTP stream map while its body is
+            # still queued. Retire both maps, including orphaned buffers.
+            stream_ids = set(self.streams) | set(self.stream_buffers)
             for stream_id in stream_ids:
                 await self._close_stream(stream_id)
             await self.has_data.set()
@@ -394,6 +406,9 @@ class H2Protocol:
             self.keep_alive_requests += 1
 
     async def _close_stream(self, stream_id: int) -> None:
+        # Release pending backpressure before app delivery, which itself may
+        # block if the application stopped reading its request body.
+        await self._retire_stream_buffer(stream_id)
         if stream_id in self.streams:
             stream = self.streams.pop(stream_id)
             await stream.handle(StreamClosed(stream_id=stream_id))
