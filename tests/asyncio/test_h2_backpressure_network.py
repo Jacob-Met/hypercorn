@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import ssl
 
 import h2.config
 import h2.connection
@@ -17,7 +18,10 @@ from hypercorn.config import Config
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminate_with", ["reset", "abort"])
-async def test_peer_disconnect_releases_flow_controlled_asgi_send(terminate_with: str) -> None:
+@pytest.mark.parametrize("tls", [False, True], ids=["h2c", "h2-tls-alpn"])
+async def test_peer_disconnect_releases_flow_controlled_asgi_send(
+    terminate_with: str, tls: bool
+) -> None:
     """A peer withholding WINDOW_UPDATE cannot consume unbounded app memory."""
     accepted = 0
     finished = asyncio.Event()
@@ -51,11 +55,24 @@ async def test_peer_disconnect_releases_flow_controlled_asgi_send(terminate_with
     config = Config()
     config.bind = [f"127.0.0.1:{port}"]
     config.graceful_timeout = 2
+    if tls:
+        config.certfile = "tests/assets/cert.pem"
+        config.keyfile = "tests/assets/key.pem"
     server = asyncio.create_task(serve(app, config, shutdown_trigger=stopping.wait))
     writer = None
     try:
         await asyncio.sleep(0.2)
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        ssl_context = None
+        if tls:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            ssl_context.set_alpn_protocols(["h2"])
+        reader, writer = await asyncio.open_connection("127.0.0.1", port, ssl=ssl_context)
+        if tls:
+            ssl_object = writer.get_extra_info("ssl_object")
+            assert ssl_object is not None
+            assert ssl_object.selected_alpn_protocol() == "h2"
         client = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True))
         client.initiate_connection()
         client.send_headers(
@@ -90,6 +107,8 @@ async def test_peer_disconnect_releases_flow_controlled_asgi_send(terminate_with
             writer.write(client.data_to_send())
             await writer.drain()
             saw_second_response = False
+            saw_second_end = False
+            second_body = bytearray()
             for _ in range(10):
                 received = await asyncio.wait_for(reader.read(65536), timeout=1)
                 assert received, "HTTP/2 connection closed before its next request"
@@ -98,14 +117,21 @@ async def test_peer_disconnect_releases_flow_controlled_asgi_send(terminate_with
                         saw_second_response = True
                         assert dict(event.headers)[b":status"] == b"200"
                     if isinstance(event, h2.events.DataReceived):
+                        if event.stream_id == 3:
+                            second_body.extend(event.data)
                         client.acknowledge_received_data(
                             event.flow_controlled_length, event.stream_id
                         )
-                if saw_second_response:
+                    if isinstance(event, h2.events.StreamEnded) and event.stream_id == 3:
+                        saw_second_end = True
+                if saw_second_response and saw_second_end:
                     break
                 writer.write(client.data_to_send())
                 await writer.drain()
-            assert saw_second_response, "Unrelated stream was blocked by reset response"
+            assert (
+                saw_second_response and saw_second_end
+            ), "Unrelated stream must fully complete after a large response is reset"
+            assert bytes(second_body) == b"ok"
         else:
             writer.transport.abort()
 
