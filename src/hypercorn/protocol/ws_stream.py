@@ -323,6 +323,9 @@ class WSStream:
             elif isinstance(event, CloseConnection):
                 if self.connection.state == ConnectionState.REMOTE_CLOSING:
                     await self._send_wsproto_event(event.response())
+                # Finish the H2 DATA stream before discarding its buffer,
+                # otherwise the queued WebSocket close reply is lost.
+                await self.send(EndData(stream_id=self.stream_id))
                 await self.send(StreamClosed(stream_id=self.stream_id))
 
     async def _send_error_response(self, status_code: int) -> None:

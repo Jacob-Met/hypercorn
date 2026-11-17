@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, call, Mock
 
 import pytest
 import pytest_asyncio
-from wsproto.events import BytesMessage, TextMessage
+from wsproto.connection import Connection as WSConnection, ConnectionType
+from wsproto.events import BytesMessage, CloseConnection, TextMessage
 
 from hypercorn.asyncio.task_group import TaskGroup
 from hypercorn.asyncio.worker_context import WorkerContext
@@ -248,6 +249,31 @@ async def test_handle_connection(stream: WSStream) -> None:
     stream.app_put.assert_called()
     assert stream.app_put.call_args_list == [
         call({"type": "websocket.receive", "bytes": None, "text": "hello"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remote_close_flushes_reply_before_stream_retirement(stream: WSStream) -> None:
+    # A WebSocket reply is H2 DATA. Retiring the stream before EndData
+    # drops the close frame from its flow-controlled outbound buffer.
+    await stream.handle(
+        Request(
+            stream_id=1,
+            http_version="2",
+            headers=[(b"sec-websocket-version", b"13")],
+            raw_path=b"/",
+            method="GET",
+            state=ConnectionState({}),
+        )
+    )
+    await stream.app_send(cast(WebsocketAcceptEvent, {"type": "websocket.accept"}))
+    stream.send.reset_mock()  # type: ignore
+    peer = WSConnection(ConnectionType.CLIENT)
+    await stream.handle(Data(stream_id=1, data=peer.send(CloseConnection(code=1000))))
+    assert stream.send.call_args_list == [  # type: ignore
+        call(Data(stream_id=1, data=b"\x88\x02\x03\xe8")),
+        call(EndData(stream_id=1)),
+        call(StreamClosed(stream_id=1)),
     ]
 
 
